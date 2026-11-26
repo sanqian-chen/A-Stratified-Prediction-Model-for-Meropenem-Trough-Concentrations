@@ -1,0 +1,426 @@
+library(dplyr)
+library(ordinalNet)
+library(MASS)
+
+# 1. 仅保留训练集 ----------------------------------------------------------
+train_data <- data %>%
+  filter(dataset == 1)
+
+# 2. 设置因变量：有序三分类 ------------------------------------------------
+train_data$血药浓度分组 <- ordered(
+  train_data$血药浓度分组,
+  levels = c(1, 2, 3)
+)
+
+# 3. 设置自变量类型 --------------------------------------------------------
+
+# 二分类变量
+train_data$是否有创机械通气 <- factor(train_data$是否有创机械通气, levels = c(0, 1))
+train_data$是否输血 <- factor(train_data$是否输血, levels = c(0, 1))
+train_data$是否使用血管活性药物 <- factor(train_data$是否使用血管活性药物, levels = c(0, 1))
+
+# CKDEPI分组作为数值型有序变量进入LASSO
+train_data$CKDEPI分组 <- as.numeric(as.character(train_data$CKDEPI分组))
+
+# 4. 定义进入LASSO的17个变量 ----------------------------------------------
+lasso_vars <- c(
+  "是否有创机械通气",
+  "是否输血",
+  "是否使用血管活性药物",
+  "年龄",
+  "尿素氮",
+  "白蛋白",
+  "ALT",
+  "血红蛋白",
+  "血小板",
+  "APACHEII",
+  "PT",
+  "APTT",
+  "Fbg",
+  "负平衡量",
+  "使用剂量",
+  "输注时间",
+  "CKDEPI分组"
+)
+
+# 5. 不去除缺失值，直接使用训练集
+lasso_data <- train_data
+
+# 6. 构建模型矩阵
+x <- model.matrix(
+  as.formula(paste("~", paste(lasso_vars, collapse = " + "))),
+  data = lasso_data
+)[, -1]
+
+y <- lasso_data$血药浓度分组
+
+# 7. 有序Logistic LASSO交叉验证 -------------------------------------------
+set.seed(123)
+
+fit_tune <- ordinalNetTune(
+  x = x,
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  alpha = 1,
+  standardize = TRUE,
+  nFolds = 10,
+  parallelTerms = TRUE,
+  nonparallelTerms = FALSE
+)
+
+# 查看交叉验证结果
+fit_tune
+
+# 8. 计算 lambda.min 和 lambda.1se -----------------------------------------
+
+lambda_seq <- fit_tune$lambdaVals
+
+mean_loglik <- rowMeans(fit_tune$loglik)
+
+se_loglik <- apply(fit_tune$loglik, 1, sd) / sqrt(ncol(fit_tune$loglik))
+
+# lambda.min：loglik最大
+idx_min <- which.max(mean_loglik)
+lambda_min <- lambda_seq[idx_min]
+
+# lambda.1se：在1SE范围内选择最大的lambda
+threshold <- mean_loglik[idx_min] - se_loglik[idx_min]
+idx_1se <- which(mean_loglik >= threshold)[1]
+lambda_1se <- lambda_seq[idx_1se]
+
+lambda_min
+lambda_1se
+
+# 9. 提取 lambda.min 下的LASSO筛选变量 ------------------------------------
+
+coef_min <- coef(
+  fit_tune$fit,
+  matrix = TRUE,
+  whichLambda = idx_min
+)
+
+coef_df_min <- data.frame(
+  变量 = rownames(coef_min),
+  系数1_logit_PY小于等于1 = coef_min[, 1],
+  系数2_logit_PY小于等于2 = coef_min[, 2],
+  stringsAsFactors = FALSE
+)
+
+selected_min <- coef_df_min %>%
+  filter(变量 != "(Intercept)") %>%
+  filter(
+    系数1_logit_PY小于等于1 != 0 |
+      系数2_logit_PY小于等于2 != 0
+  )
+
+selected_min
+
+# 10. 提取 lambda.1se 下的LASSO筛选变量 -----------------------------------
+
+coef_1se <- coef(
+  fit_tune$fit,
+  matrix = TRUE,
+  whichLambda = idx_1se
+)
+
+coef_df_1se <- data.frame(
+  变量 = rownames(coef_1se),
+  系数1_logit_PY小于等于1 = coef_1se[, 1],
+  系数2_logit_PY小于等于2 = coef_1se[, 2],
+  stringsAsFactors = FALSE
+)
+
+selected_1se <- coef_df_1se %>%
+  filter(变量 != "(Intercept)") %>%
+  filter(
+    系数1_logit_PY小于等于1 != 0 |
+      系数2_logit_PY小于等于2 != 0
+  )
+
+selected_1se
+
+# 11. 建议最终采用 lambda.1se 筛选变量 ------------------------------------
+
+final_lasso_vars <- selected_1se$变量
+
+final_lasso_vars
+
+# 如果lambda.1se筛选变量过少，也可以查看lambda.min结果
+selected_min
+
+
+# 12. 绘制交叉验证曲线图 ---------------------------------------------------
+# lambda序列
+lambda_seq <- fit_tune$lambdaVals
+
+# 交叉验证log-likelihood
+mean_loglik <- rowMeans(fit_tune$loglik)
+
+# log-likelihood标准误
+se_loglik <- apply(fit_tune$loglik, 1, sd) / sqrt(ncol(fit_tune$loglik))
+
+# 将log-likelihood转换为loss
+# 因为loglik越大越好，而loss越小越好
+cv_loss <- -mean_loglik
+se_loss <- se_loglik
+
+# lambda.min：loss最小
+idx_min <- which.min(cv_loss)
+lambda_min <- lambda_seq[idx_min]
+
+# lambda.1se：在min + 1SE范围内选择最大的lambda
+threshold <- cv_loss[idx_min] + se_loss[idx_min]
+
+# lambda_seq是从大到小排列，所以第一个满足条件的就是最大的lambda
+idx_1se <- which(cv_loss <= threshold)[1]
+lambda_1se <- lambda_seq[idx_1se]
+
+lambda_min
+lambda_1se
+
+# 计算每个lambda下的非零变量个数
+nzero_plot <- sapply(seq_along(lambda_seq), function(i) {
+  
+  coef_i <- coef(
+    fit_tune$fit,
+    matrix = TRUE,
+    whichLambda = i
+  )
+  
+  # 去掉截距
+  coef_i <- coef_i[
+    rownames(coef_i) != "(Intercept)",
+    ,
+    drop = FALSE
+  ]
+  
+  # 只要两个logit中任意一个非0，就认为该变量被筛选
+  sum(
+    apply(abs(coef_i) > 1e-10, 1, any)
+  )
+})
+
+# 绘图用对象
+x_plot <- log(lambda_seq)
+y_plot <- cv_loss
+se_plot <- se_loss
+
+# y轴范围，确保误差线完整显示
+y_min <- min(y_plot - se_plot)
+y_max <- max(y_plot + se_plot)
+
+# 参数设置
+op <- par(no.readonly = TRUE)
+par(mar = c(5, 5, 4, 2))   # 顶部边距比原来略小一些
+
+plot(
+  x_plot,
+  y_plot,
+  type = "n",
+  xlab = "Log(lambda)",
+  ylab = "Mean cross-validated loss",
+  main = "Cross-validation curve",
+  ylim = c(y_min, y_max * 1.03)
+)
+
+# 误差线
+arrows(
+  x_plot,
+  y_plot - se_plot,
+  x_plot,
+  y_plot + se_plot,
+  angle = 90,
+  code = 3,
+  length = 0.04,
+  col = "grey70"
+)
+
+# 均值点和连线
+lines(
+  x_plot,
+  y_plot,
+  type = "b",
+  pch = 19,
+  col = "red",
+  lwd = 2
+)
+
+# lambda.min 和 lambda.1se 垂线
+abline(
+  v = log(lambda_min),
+  lty = 2,
+  lwd = 2,
+  col = "grey30"
+)
+
+abline(
+  v = log(lambda_1se),
+  lty = 2,
+  lwd = 2,
+  col = "grey30"
+)
+
+# 顶部只显示非零变量个数数字，不再显示文字说明
+axis(
+  side = 3,
+  at = x_plot,
+  labels = nzero_plot,
+  tick = FALSE,
+  cex.axis = 0.9
+)
+
+par(op)
+
+
+# 13. 绘制LASSO系数路径图 --------------------------------------------------
+# 提取所有lambda下的系数
+coef_list <- lapply(seq_along(lambda_seq), function(i) {
+  
+  coef_i <- coef(
+    fit_tune$fit,
+    matrix = TRUE,
+    whichLambda = i
+  )
+  
+  coef_i[,1]
+  
+})
+
+coef_path <- do.call(rbind, coef_list)
+
+colnames(coef_path) <- rownames(
+  coef(
+    fit_tune$fit,
+    matrix = TRUE,
+    whichLambda = 1
+  )
+)
+
+coef_path <- coef_path[
+  ,
+  colnames(coef_path)!="(Intercept)",
+  drop = FALSE
+]
+
+# 医学论文风格配色
+my_cols <- c(
+  "#E41A1C",  # 红
+  "#FF7F00",  # 橙
+  "#B3DE00",  # 黄绿
+  "#33A02C",  # 绿
+  "#00C853",  # 翠绿
+  "#00BCD4",  # 青
+  "#1E88E5",  # 蓝
+  "#2962FF",  # 深蓝
+  "#7C4DFF",  # 紫
+  "#AA00FF",  # 深紫
+  "#FF00FF",  # 洋红
+  "#F06292",  # 粉
+  "#D81B60",  # 深粉
+  "#00897B",  # 墨绿
+  "#5E35B1",  # 蓝紫
+  "#546E7A"   # 灰蓝
+)
+
+# 绘图
+matplot(
+  log(lambda_seq),
+  coef_path,
+  type = "l",
+  lwd = 2,
+  lty = 1,
+  col = my_cols,
+  xlab = "log(Lambda)",
+  ylab = "Coefficient",
+  main = "LASSO Coefficient Path"
+)
+
+# 保留0参考线
+abline(h = 0,
+       col = "grey50",
+       lty = 2)
+
+legend(
+  "topright",
+  legend = colnames(coef_path),
+  col = my_cols,
+  lwd = 2,
+  cex = 0.8,
+  bty = "n"
+)
+
+
+
+
+
+
+####为了显示英文图例，直接让图例消失。
+coef_list <- lapply(seq_along(lambda_seq), function(i) {
+  
+  coef_i <- coef(
+    fit_tune$fit,
+    matrix = TRUE,
+    whichLambda = i
+  )
+  
+  coef_i[,1]
+  
+})
+
+coef_path <- do.call(rbind, coef_list)
+
+colnames(coef_path) <- rownames(
+  coef(
+    fit_tune$fit,
+    matrix = TRUE,
+    whichLambda = 1
+  )
+)
+
+coef_path <- coef_path[
+  ,
+  colnames(coef_path)!="(Intercept)",
+  drop = FALSE
+]
+
+# 医学论文风格配色
+my_cols <- c(
+  "#E41A1C",  # 红
+  "#FF7F00",  # 橙
+  "#B3DE00",  # 黄绿
+  "#33A02C",  # 绿
+  "#00C853",  # 翠绿
+  "#00BCD4",  # 青
+  "#1E88E5",  # 蓝
+  "#2962FF",  # 深蓝
+  "#7C4DFF",  # 紫
+  "#AA00FF",  # 深紫
+  "#FF00FF",  # 洋红
+  "#F06292",  # 粉
+  "#D81B60",  # 深粉
+  "#00897B",  # 墨绿
+  "#5E35B1",  # 蓝紫
+  "#546E7A"   # 灰蓝
+)
+
+# 绘图
+matplot(
+  log(lambda_seq),
+  coef_path,
+  type = "l",
+  lwd = 2,
+  lty = 1,
+  col = my_cols,
+  xlab = "log(Lambda)",
+  ylab = "Coefficient",
+  main = "LASSO Coefficient Path"
+)
+
+# 保留0参考线
+abline(h = 0,
+       col = "grey50",
+       lty = 2)
+
+
+
